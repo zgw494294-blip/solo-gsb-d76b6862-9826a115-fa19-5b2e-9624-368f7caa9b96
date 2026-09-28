@@ -31,6 +31,9 @@ Birnbaum 重要度（`P(top | 强制该事件=1) − P(top | 强制该事件=0)`
 还提供观测冲突定位接口 `POST /v1/observation-conflicts`：给定 1～16 个对事件或门的布尔读数，
 返回全部**最小零概率观测组**——组内读数同时成立的先验概率为 0、但删去组内任一项后概率大于 0；
 全部读数可同时成立时返回空组列。
+还提供模板实例化展开接口 `POST /v1/expand-model`：给定 1～8 个可复用模板（各含参数、门、
+子实例与 `top`）与一个根实例（根参数绑定到事件），递归展开全部子实例，返回门名为
+`root/实例路径/门名` 的扁平故障树，可直接提交给 `/v1/analyze`。
 
 ## 快速启动（Docker Compose）
 
@@ -51,6 +54,7 @@ docker compose up --build
 - 失效数分布接口：`http://localhost:8000/v1/failure-count`
 - 首次故障时间接口：`http://localhost:8000/v1/first-failure-time`
 - 观测冲突定位接口：`http://localhost:8000/v1/observation-conflicts`
+- 模板实例化展开接口：`http://localhost:8000/v1/expand-model`
 - 健康检查：`http://localhost:8000/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -723,6 +727,114 @@ curl -X POST http://localhost:8000/v1/observation-conflicts \
   关于组的包含关系单调"跳过已知含冲突的超集。
 - 结果超过 **5000** 组、或累计非终端节点超过 **50000** 时返回 422 并说明原因。
 
+## 模板实例化展开示例（POST /v1/expand-model）
+
+`events` 的格式与校验同 `/v1/analyze`。另收：
+
+- `templates`：**1～8** 项「模板名 → 模板定义」。每个模板含：
+  - `params`：参数名列表（可空）；
+  - `gates`：**非空**门列表，格式同 `/v1/analyze` 的门，但 `inputs` 引用的是**本地参数、
+    本模板内的门或子实例 id**（取该子实例的顶层输出），不能直接写事件 id；
+  - `instances`：子实例列表（可空），每项含 `id`、`template`（被调模板名）与 `bindings`；
+  - `top`：本模板顶层节点，引用本地参数、门或子实例 id。
+- `root`：根实例，含 `template` 与 `bindings`。根模板参数通过 `bindings` 绑定到**事件 id**；
+  子实例的 `bindings` 只能把被调模板参数绑定到**父模板的参数**。所有 `bindings` 都必须
+  **恰好覆盖**被调模板的全部参数（缺项或多项均返回 422）。
+
+命名规则：模板名、参数名、门名、实例名一律为 **ASCII 字母开头、后接字母/数字/下划线**；
+同一模板内参数名、门名、实例名**两两互异**（跨种类也不能重名）。门的算子与元数校验同
+`/v1/analyze`（`AND`/`OR` 为 2～8 输入，`NOT` 恰有 1 输入）。
+
+展开后每个实例的门被赋予全局唯一名 **`root[/子实例 id …]/门名`**；参数按各层绑定解析为
+事件 id，子实例输出解析为该子实例展开后的 `top`。多个实例（含同一模板的多个实例）绑定到
+同一事件时**共享该事件的状态与 id**。响应原样返回 `events`，并给出扁平的 `gates` 与 `top`，
+其格式与 `/v1/analyze` 请求体完全一致，可直接提交分析。
+
+下例定义二选一组件 `Voter`（`OR`）与系统模板 `System`（`AND` 两个 `Voter` 实例）：
+
+```bash
+curl -X POST http://localhost:8000/v1/expand-model \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [
+      {"id": "motor_overheat", "p": "1/100"},
+      {"id": "coolant_loss",  "p": "2/100"},
+      {"id": "pump_fail",     "p": "1/200"}
+    ],
+    "templates": {
+      "Voter": {
+        "params": ["a", "b"],
+        "gates": [
+          {"id": "any", "op": "OR", "inputs": ["a", "b"]}
+        ],
+        "instances": [],
+        "top": "any"
+      },
+      "System": {
+        "params": ["m", "c", "p"],
+        "gates": [
+          {"id": "all", "op": "AND", "inputs": ["m", "cooling", "hydraulic"]}
+        ],
+        "instances": [
+          {"id": "cooling", "template": "Voter",
+           "bindings": {"a": "c", "b": "p"}},
+          {"id": "hydraulic", "template": "Voter",
+           "bindings": {"a": "m", "b": "p"}}
+        ],
+        "top": "all"
+      }
+    },
+    "root": {
+      "template": "System",
+      "bindings": {"m": "motor_overheat", "c": "coolant_loss", "p": "pump_fail"}
+    }
+  }'
+```
+
+响应（门按“本模板门在前、子实例门按 `instances` 顺序在后”的前序排列）：
+
+```json
+{
+  "events": [
+    {"id": "motor_overheat", "p": "1/100"},
+    {"id": "coolant_loss",  "p": "2/100"},
+    {"id": "pump_fail",     "p": "1/200"}
+  ],
+  "gates": [
+    {"id": "root/all", "op": "AND",
+     "inputs": ["motor_overheat", "root/cooling/any", "root/hydraulic/any"]},
+    {"id": "root/cooling/any", "op": "OR",
+     "inputs": ["coolant_loss", "pump_fail"]},
+    {"id": "root/hydraulic/any", "op": "OR",
+     "inputs": ["motor_overheat", "pump_fail"]}
+  ],
+  "top": "root/all"
+}
+```
+
+该响应可原样作为 `/v1/analyze` 的请求体（以 shell 管道串联两个接口）：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/expand-model \
+  -H "Content-Type: application/json" -d @model.json \
+| curl -s -X POST http://localhost:8000/v1/analyze \
+  -H "Content-Type: application/json" -d @-
+```
+
+- 模板支持任意深度嵌套（如模板 `A` 含模板 `B` 的实例、`B` 再含 `C` 的实例），门路径保留
+  完整实例链：`root/实例1/实例2/门名`；被调模板未使用的参数与未被 `top` 引用的门均允许存在。
+- **模板间不允许递归**（直接自递归或多模板相互递归，即使未被 `root` 触达）；模板**内部**
+  的门引用关系也不允许成环。
+- **展开后的门总数超过 64**（与 `/v1/analyze` 的门数上限一致）时返回 422。
+- 除上述模板规则外，事件与门的其余校验（概率、ASCII id、门元数、引用、环等）沿用
+  `/v1/analyze`；展开后的门路径若与事件 id 冲突同样返回 422。
+
+绑定缺项的响应示例（`Voter` 需要 `a`、`b` 两个参数，只绑定了一个）：
+
+```json
+{ "detail": "root 调用模板 'Voter' 的 bindings 缺少参数绑定：'b'" }
+```
+
 ## 输入格式
 
 | 字段 | 规则 |
@@ -745,6 +857,10 @@ curl -X POST http://localhost:8000/v1/observation-conflicts \
 | `steps`（仅 `/v1/first-failure-time`） | 必填，**1～10** 的整数转移步数 |
 | `transitions`（仅 `/v1/first-failure-time`） | 必填，键必须**恰好覆盖全部事件 id**；每项含 `fail`、`recover` 两个 `n/d` 概率（`0≤n≤d≤10^6`），分别为每步的故障概率与恢复概率 |
 | `observations`（仅 `/v1/observation-conflicts`） | 必填，**1～16** 个键值对；键必须是已声明的事件或门 id，值为严格布尔值；返回这组读数之间的全部最小零概率观测组 |
+| `templates`（仅 `/v1/expand-model`） | 必填，**1～8** 项「模板名 → 模板定义」；模板含 `params`（可空）、非空 `gates`、`instances`（可空）与 `top`；门输入与 `top` 只能引用本地参数、本地门或子实例 id |
+| 模板名称（仅 `/v1/expand-model`） | 模板名、参数名、门名、实例名均须 ASCII 字母开头、后接字母/数字/下划线；同一模板内参数/门/实例名两两互异 |
+| `bindings`（仅 `/v1/expand-model`） | root 把根模板参数绑定到事件 id；子实例把被调模板参数绑定到父模板参数；键必须恰好覆盖被调模板全部参数 |
+| `root`（仅 `/v1/expand-model`） | 必填，含 `template`（已定义模板名）与 `bindings`；展开后门名为 `root[/实例 id …]/门名`，门总数不超过 **64** |
 
 概率在节点上按 `P(node) = (1-p_v)·P(low) + p_v·P(high)` 自底向上精确传播；
 事件重要度通过“根到节点路径概率质量”单遍传播精确求得。
@@ -813,6 +929,11 @@ curl -X POST http://localhost:8000/v1/observation-conflicts \
 - `/v1/observation-conflicts` 的 `observations` 为空或超过 **16** 个、键不是已声明的
   事件或门 id、值不是严格布尔值（`1`、`0`、字符串等同样拒绝）；
 - `/v1/observation-conflicts` 的最小零概率观测组超过 **5000** 组；
+- `/v1/expand-model` 的模板名/参数名/门名/实例名不符合命名规则、模板内参数/门/实例
+  重名（含跨种类重名）、门元数非法、root 或子实例调用未定义模板、`bindings` 缺项或
+  绑定了不属于被调模板的参数、root 参数绑定到未知事件、子实例参数绑定到非父参数、
+  门输入或 `top` 引用未知本地节点、模板内门成环、模板间递归（含未被 root 触达的模板）、
+  或展开后门总数超过 **64**；
 - ROBDD 构建过程中累计创建的非终端节点超过 **50000** 个
   （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/inspect-next`、
   `/v1/likely-cause`、`/v1/failure-count`、`/v1/first-failure-time` 与
@@ -868,4 +989,5 @@ tests/test_compare_trees.py
 tests/test_failure_count.py
 tests/test_first_failure_time.py
 tests/test_observation_conflicts.py
+tests/test_expand_model.py
 ```
