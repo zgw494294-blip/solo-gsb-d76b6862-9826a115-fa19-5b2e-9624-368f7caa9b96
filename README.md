@@ -31,6 +31,10 @@ Birnbaum 重要度（`P(top | 强制该事件=1) − P(top | 强制该事件=0)`
 还提供观测冲突定位接口 `POST /v1/observation-conflicts`：给定 1～16 个对事件或门的布尔读数，
 返回全部**最小零概率观测组**——组内读数同时成立的先验概率为 0、但删去组内任一项后概率大于 0；
 全部读数可同时成立时返回空组列。
+还提供参数化模板展开接口 `POST /v1/expand-model`：给定 1～8 个可相互实例化的**模板**（形参化的
+门与子实例结构）与一个把形参绑定到事件的 `root` 实例，递归展开全部实例为扁平的 `gates`/`top`
+（门名为 `root/实例路径/门名`，共享事件保留原 id），返回原 `events` 与展开结果，可直接作为
+`/v1/analyze` 等接口的请求体。
 
 ## 快速启动（Docker Compose）
 
@@ -51,6 +55,7 @@ docker compose up --build
 - 失效数分布接口：`http://localhost:8000/v1/failure-count`
 - 首次故障时间接口：`http://localhost:8000/v1/first-failure-time`
 - 观测冲突定位接口：`http://localhost:8000/v1/observation-conflicts`
+- 模板展开接口：`http://localhost:8000/v1/expand-model`
 - 健康检查：`http://localhost:8000/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -723,6 +728,124 @@ curl -X POST http://localhost:8000/v1/observation-conflicts \
   关于组的包含关系单调"跳过已知含冲突的超集。
 - 结果超过 **5000** 组、或累计非终端节点超过 **50000** 时返回 422 并说明原因。
 
+## 模板展开请求示例（POST /v1/expand-model）
+
+在 `events` 之外另收 `templates`（**1～8** 个「模板名 → 模板定义」）与 `root`（根实例）：
+
+- **模板名**、参数名、门名、实例名都必须以 ASCII 字母开头、其后只接字母、数字、下划线；
+  同一模板内的参数名 / 门名 / 实例名**两两互异**。
+- 每个模板含：
+  - `params`：形参名列表（可为空）；
+  - `gates`：**非空**门列表，门的 `op`/元数规则与 `/v1/analyze` 相同，但门 `inputs`
+    与模板 `top` 的引用只能指向**本模板的参数、本模板的门或子实例**（引用子实例即取其
+    被调模板 `top` 的输出）；
+  - `instances`：子实例列表，每项含 `id`、`template`（被调模板名）与
+    `bindings`（**被调模板参数名 → 父模板参数名**，键必须恰好覆盖被调模板的全部参数，
+    值只能是父模板参数）；
+  - `top`：本模板的顶层引用。
+- `root` 含 `template` 与 `bindings`（**根模板参数名 → 事件 id**，恰好覆盖根模板参数）；
+  只有 root 的参数能绑定事件，子实例参数只能绑定父模板参数。
+- 模板之间**不允许递归**（实例调用成环，含自调用）。
+
+展开规则：
+
+- 每个实例在路径 `root`、`root.<实例名>`、`root.<父实例>.<子实例>` 处各生成一份门，
+  展开后的门 id 为 **`<实例路径>/<模板内门名>`**（如 `root.pump.fan/g1`）；
+- 模板形参在各实例处解析为 root 绑定的**共享事件 id**：同一父参数绑给多个子参数时，
+  它们共用同一个事件（保留原事件 id），同一事件在展开树中的多处引用共享状态；
+- 展开后返回原 `events`（原样）与扁平 `gates`、`top`，本身即为合法的 `/v1/analyze`
+  请求体，可直接继续送 `/v1/analyze`、`/v1/cut-sets`、`/v1/diagnose` 等接口；
+- 展开后的门总数超过 **64** 时返回 422。
+
+下例用两层模板描述“泵包含一个风扇”：`Fan(x, y) = x OR y`，
+`Pump(u, v, w) = Fan(u, v) AND w`，root 把三个形参绑到事件 `a`/`b`/`c`，
+并让 `w` 与 `u` 共用事件 `b`：
+
+```bash
+curl -X POST http://localhost:8000/v1/expand-model \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [
+      {"id": "a", "p": "1/2"},
+      {"id": "b", "p": "1/3"},
+      {"id": "c", "p": "1/5"}
+    ],
+    "templates": {
+      "Fan": {
+        "params": ["x", "y"],
+        "gates": [
+          {"id": "g1", "op": "OR", "inputs": ["x", "y"]}
+        ],
+        "instances": [],
+        "top": "g1"
+      },
+      "Pump": {
+        "params": ["u", "v", "w"],
+        "gates": [
+          {"id": "g2", "op": "AND", "inputs": ["fan", "w"]}
+        ],
+        "instances": [
+          {"id": "fan", "template": "Fan",
+           "bindings": {"x": "u", "y": "v"}}
+        ],
+        "top": "g2"
+      },
+      "Root": {
+        "params": ["p1", "p2", "p3"],
+        "gates": [
+          {"id": "g3", "op": "OR", "inputs": ["p1", "pump"]}
+        ],
+        "instances": [
+          {"id": "pump", "template": "Pump",
+           "bindings": {"u": "p2", "v": "p3", "w": "p2"}}
+        ],
+        "top": "g3"
+      }
+    },
+    "root": {
+      "template": "Root",
+      "bindings": {"p1": "a", "p2": "b", "p3": "c"}
+    }
+  }'
+```
+
+响应（门按“本模板门先于子实例深层门”的前序排列；`p2` 同时绑给 `u` 和 `w`，
+故事件 `b` 在 `g2` 与 `g1` 两处共享）：
+
+```json
+{
+  "events": [
+    {"id": "a", "p": "1/2"},
+    {"id": "b", "p": "1/3"},
+    {"id": "c", "p": "1/5"}
+  ],
+  "gates": [
+    {"id": "root/g3", "op": "OR",
+     "inputs": ["a", "root.pump/g2"]},
+    {"id": "root.pump/g2", "op": "AND",
+     "inputs": ["root.pump.fan/g1", "b"]},
+    {"id": "root.pump.fan/g1", "op": "OR",
+     "inputs": ["b", "c"]}
+  ],
+  "top": "root/g3"
+}
+```
+
+- 展开结果等价于 `a OR ((b OR c) AND b) = a OR b`，把该响应体原样 POST 给
+  `/v1/analyze` 即得 `top_probability = 2/3`（事件 `c` 的重要度为 `0/1`）。
+- root 模板的 `top` 若是形参，展开后 `top` 直接是该参数绑定的事件 id（如 `"b"`）；
+  模板 `top` 若是子实例，则沿实例链解析到深层实例的顶层门（如
+  `root.pump.fan/g1`），门 `inputs` 中引用子实例同理。
+- 模板的门不允许引用其它模板的名字——跨模板只能通过 `instances` + `bindings` 传参。
+
+绑定错误、引用未定义模板、模板内未知引用、名称不合法或冲突、门元数错误、门环、
+模板递归、root 模板未定义、或展开后门数超过 64 时均返回 422，多项问题在同一条
+`detail` 中一并说明，例如递归：
+
+```json
+{ "detail": "模板递归调用成环：B → C → B；实例展开不允许递归" }
+```
+
 ## 输入格式
 
 | 字段 | 规则 |
@@ -745,6 +868,7 @@ curl -X POST http://localhost:8000/v1/observation-conflicts \
 | `steps`（仅 `/v1/first-failure-time`） | 必填，**1～10** 的整数转移步数 |
 | `transitions`（仅 `/v1/first-failure-time`） | 必填，键必须**恰好覆盖全部事件 id**；每项含 `fail`、`recover` 两个 `n/d` 概率（`0≤n≤d≤10^6`），分别为每步的故障概率与恢复概率 |
 | `observations`（仅 `/v1/observation-conflicts`） | 必填，**1～16** 个键值对；键必须是已声明的事件或门 id，值为严格布尔值；返回这组读数之间的全部最小零概率观测组 |
+| 请求体（仅 `/v1/expand-model`） | 另收 `templates`（1～8 个名称→模板定义）与 `root`（`template`+`bindings`）；模板含 `params`、非空 `gates`、`instances` 与 `top`；root 参数绑事件，子实例参数绑父参数且 bindings 恰好覆盖被调模板参数；展开后门名为 `root/实例路径/门名`，门数上限 **64** |
 
 概率在节点上按 `P(node) = (1-p_v)·P(low) + p_v·P(high)` 自底向上精确传播；
 事件重要度通过“根到节点路径概率质量”单遍传播精确求得。
@@ -778,6 +902,14 @@ curl -X POST http://localhost:8000/v1/observation-conflicts \
 （至多 16 个观测）自底向上枚举合取：完全合取非零时直接返回空组列；否则利用零概率关于组的
 包含关系单调，跳过删单元素后已知零概率的超集，其余子集各经一次 `and_` 在共享唯一表上求值，
 为终端 0 即一个最小组，全程不枚举事件赋值。
+`/v1/expand-model` 不构建 ROBDD，只做模板的静态校验与实例展开：先对**全部模板**
+（含未被 root 引用的）检查名称规则、模板内参数/门/实例名互异、门元数、门输入与
+top 的本地引用完整性、门环以及子实例绑定的覆盖与取值，再在实例调用图上做 DFS
+三色标记检测模板递归；展开时沿 `root/实例路径` 为每个实例的门生成全路径门名，
+把形参按各级 bindings 解析为 root 绑定的共享事件 id（同一形参的多处引用解析到
+同一事件），对子实例的引用沿其 top 链解析为确定的全局门名或事件 id；展开结果再
+沿用 `/v1/analyze` 的门校验做最终兜底（含全路径门名与事件 id 冲突），门数超过 64
+即停并返回 422。
 
 ## 错误处理（HTTP 422）
 
@@ -813,6 +945,14 @@ curl -X POST http://localhost:8000/v1/observation-conflicts \
 - `/v1/observation-conflicts` 的 `observations` 为空或超过 **16** 个、键不是已声明的
   事件或门 id、值不是严格布尔值（`1`、`0`、字符串等同样拒绝）；
 - `/v1/observation-conflicts` 的最小零概率观测组超过 **5000** 组；
+- `/v1/expand-model` 的模板名/参数名/门名/实例名不符合「ASCII 字母开头、后接
+  字母数字下划线」，模板内参数/门/实例名重复或跨类冲突；门元数非法；门输入或
+  `top` 引用了本模板不存在的名称；模板内门引用关系存在环；
+- `/v1/expand-model` 的子实例引用未定义模板、`bindings` 未恰好覆盖被调模板参数
+  （缺项或多项）、绑定值不是父模板参数，或 root 的 `template` 未定义、绑定未恰好
+  覆盖根模板参数、绑定值不是已声明事件 id；
+- `/v1/expand-model` 的实例调用关系存在**模板递归**（成环，含模板自调用），或展开
+  后的门总数超过 **64**；未被 root 引用的模板同样参与全部静态校验；
 - ROBDD 构建过程中累计创建的非终端节点超过 **50000** 个
   （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/inspect-next`、
   `/v1/likely-cause`、`/v1/failure-count`、`/v1/first-failure-time` 与
@@ -868,4 +1008,5 @@ tests/test_compare_trees.py
 tests/test_failure_count.py
 tests/test_first_failure_time.py
 tests/test_observation_conflicts.py
+tests/test_expand_model.py
 ```

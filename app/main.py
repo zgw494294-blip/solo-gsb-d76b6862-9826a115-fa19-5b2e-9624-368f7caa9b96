@@ -97,11 +97,29 @@ POST /v1/observation-conflicts
   不枚举事件赋值；结果超过 5000 组或累计非终端节点超过 50000 时
   返回 422。
 
+POST /v1/expand-model
+  输入：events（同 /v1/analyze）、templates（1~8 个名称→模板定义）、
+        root（template、bindings）。模板含 params（参数名列表）、
+        gates（非空，门定义同 /v1/analyze）、instances（实例列表：
+        id、template、bindings）与 top。所有名称以 ASCII 字母开头、
+        后接字母数字下划线；模板内参数/门/实例名两两互异。root 的
+        参数绑定事件 id；子实例参数只能绑定父模板参数；bindings
+        恰好覆盖被调模板的参数。门 inputs/top 引用本地参数、本地门
+        或子实例（其顶层输出）。
+  输出：递归展开全部实例的扁平故障树：events 原样返回；门名为
+        root/实例路径/门名（如 root.pump.fan/g1），参数引用解析为
+        root 绑定的共享事件 id（保留原事件 id）；顶层节点为
+        root/<root 模板 top>（top 为参数时直接为事件 id）。展开结果
+        本身即为合法的 /v1/analyze 请求体。模板递归（实例调用成环）、
+        绑定错误、未知引用、名称冲突、门环、引用未定义模板或展开后
+        门数超过 64 时返回 422。
+
 所有错误输入（未知引用、跨版引用、环、非法概率、节点超限等）统一返回 422。
 """
 
 from __future__ import annotations
 
+import re
 from fractions import Fraction
 from typing import Callable, Dict, List, Literal, Optional, Tuple
 
@@ -368,6 +386,76 @@ class ObservationConflictsResponse(BaseModel):
         description="全部最小零概率观测组：每组只列观测 id，组内按 id 排序，"
         "组间按长度及字典序排序；全部读数可同时成立时为空",
     )
+
+
+class TemplateGateIn(BaseModel):
+    """模板内的门定义：id 为模板内局部名称。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, description="模板内唯一的局部门名")
+    op: GateOp = Field(..., description="门算子：AND / OR / NOT")
+    inputs: List[str] = Field(
+        ..., min_length=1, description="输入引用：本地参数、本地门或子实例"
+    )
+
+
+class TemplateInstanceIn(BaseModel):
+    """模板内的子实例：以另一模板为结构，bindings 把该模板参数绑到父参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, description="模板内唯一的局部实例名")
+    template: str = Field(..., min_length=1, description="调用的模板名称")
+    bindings: Dict[str, str] = Field(
+        ...,
+        description="被调模板参数名 → 父模板参数名；必须恰好覆盖被调模板参数",
+    )
+
+
+class TemplateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    params: List[str] = Field(
+        default_factory=list, description="形参名列表（可为空），仅由 root 绑定事件"
+    )
+    gates: List[TemplateGateIn] = Field(..., min_length=1, description="非空门列表")
+    instances: List[TemplateInstanceIn] = Field(
+        default_factory=list, description="子实例列表（可为空）"
+    )
+    top: str = Field(
+        ..., min_length=1, description="顶层引用：本地参数、本地门或子实例"
+    )
+
+
+class RootInstanceIn(BaseModel):
+    """根实例：参数绑定到全局事件 id。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    template: str = Field(..., min_length=1, description="根模板名称")
+    bindings: Dict[str, str] = Field(
+        ...,
+        description="根模板参数名 → 事件 id；必须恰好覆盖根模板参数",
+    )
+
+
+class ExpandModelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: List[EventIn] = Field(..., min_length=1, max_length=32)
+    templates: Dict[str, TemplateIn] = Field(
+        ..., min_length=1, max_length=8, description="1~8 个模板名称→模板定义"
+    )
+    root: RootInstanceIn = Field(..., description="根实例：模板名与事件绑定")
+
+
+class ExpandModelResponse(BaseModel):
+    events: List[EventIn] = Field(..., description="原 events，原样返回")
+    gates: List[GateIn] = Field(
+        ..., description="展开后的全部门，门名为 root/实例路径/门名"
+    )
+    top: str = Field(..., description="展开后的顶层节点 id（事件 id 或全路径门名）")
 
 
 def _bad_request(reason: str) -> JSONResponse:
@@ -1184,6 +1272,335 @@ def observation_conflicts_logic(
     return ObservationConflictsResponse(conflicts=conflicts)
 
 
+# ---------- /v1/expand-model：参数化模板实例展开 ----------
+
+# 所有名称（模板名、参数名、门名、实例名）：ASCII 字母开头，后接字母数字下划线
+_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+# 展开后门数上限与 /v1/analyze 的门列表上限一致
+MAX_EXPANDED_GATES = 64
+
+
+def _validate_templates_static(
+    templates: Dict[str, TemplateIn],
+) -> None:
+    """对全部模板做不依赖展开的静态校验，任一问题收集后统一抛 ValueError。
+
+    覆盖：模板名合法性与重复、模板内参数/门/实例名的合法性与两两互异、
+    门元数（沿用门校验：AND/OR 2~8、NOT 1）、门输入与 top 的引用完整性
+    （只能引用本地参数/门/子实例）、模板内门环、子实例绑定是否恰好覆盖
+    被调模板参数且只能引用父模板参数、实例是否引用未定义模板。
+    """
+    errors: List[str] = []
+    seen_errors: set = set()
+
+    def report(msg: str) -> None:
+        if msg not in seen_errors:  # 同一位置重复引用产生的重复错误只报一次
+            seen_errors.add(msg)
+            errors.append(msg)
+
+    # ---- 模板名合法性与重复（dict 键天然不重复，仅检查格式）----
+    for tname in templates:
+        if not _NAME_RE.fullmatch(tname):
+            report(
+                f"模板名 {tname!r} 非法：必须以 ASCII 字母开头，"
+                "其后只能是字母、数字或下划线"
+            )
+
+    for tname, tpl in templates.items():
+        where = f"模板 {tname!r}"
+        bad_names: set = set()
+
+        def _check_local_name(name: str, kind: str) -> None:
+            if not _NAME_RE.fullmatch(name) and (kind, name) not in bad_names:
+                # 同一非法名称（如重复出现）只报一次
+                bad_names.add((kind, name))
+                report(
+                    f"{where} 的{kind}名 {name!r} 非法：必须以 ASCII 字母开头，"
+                    "其后只能是字母、数字或下划线"
+                )
+
+        # ---- 参数名合法性 + 列表内重复 ----
+        seen_params: set = set()
+        for p in tpl.params:
+            _check_local_name(p, "参数")
+            if p in seen_params:
+                report(f"{where} 的参数名重复：{p!r}")
+            seen_params.add(p)
+
+        # ---- 门名合法性 + 列表内重复 + 元数 ----
+        gate_ops: Dict[str, GateOp] = {}
+        gate_inputs: Dict[str, List[str]] = {}
+        for gate in tpl.gates:
+            _check_local_name(gate.id, "门")
+            if gate.id in gate_ops:
+                report(f"{where} 的门名重复：{gate.id!r}")
+            n_inputs = len(gate.inputs)
+            if gate.op == "NOT":
+                if n_inputs != 1:
+                    report(
+                        f"{where} 的门 {gate.id!r} 为 NOT，必须恰好有 1 个输入，"
+                        f"实际 {n_inputs} 个"
+                    )
+            elif n_inputs < 2 or n_inputs > 8:
+                report(
+                    f"{where} 的门 {gate.id!r} 为 {gate.op}，必须有 2~8 个输入，"
+                    f"实际 {n_inputs} 个"
+                )
+            gate_ops[gate.id] = gate.op
+            gate_inputs[gate.id] = list(gate.inputs)
+
+        # ---- 实例名合法性 + 列表内重复 ----
+        instance_ids: set = set()
+        for inst in tpl.instances:
+            _check_local_name(inst.id, "实例")
+            if inst.id in instance_ids:
+                report(f"{where} 的实例名重复：{inst.id!r}")
+            instance_ids.add(inst.id)
+
+        # ---- 三类名称两两互异（不同命名空间也不许同名）----
+        for shared in seen_params & gate_ops.keys():
+            report(f"{where} 的参数名与门名冲突：{shared!r}")
+        for shared in seen_params & instance_ids:
+            report(f"{where} 的参数名与实例名冲突：{shared!r}")
+        for shared in gate_ops.keys() & instance_ids:
+            report(f"{where} 的门名与实例名冲突：{shared!r}")
+
+        local_known = seen_params | gate_ops.keys() | instance_ids
+
+        # ---- 门输入与 top：只能引用本地参数、本地门或子实例 ----
+        def check_ref(ref: str, site: str) -> None:
+            if ref not in local_known:
+                report(
+                    f"{where} 的{site}引用了未知名称 {ref!r}：必须是本模板的"
+                    "参数、门或子实例名"
+                )
+
+        for gate in tpl.gates:
+            for ref in gate.inputs:
+                check_ref(ref, f"门 {gate.id!r} 输入")
+        check_ref(tpl.top, "top ")
+
+        # ---- 模板内门环：仅门→门的依赖参与成环（参数为叶子、实例为叶子）----
+        color: Dict[str, int] = {gid: 0 for gid in gate_ops}
+
+        def dfs_gate(gid: str) -> None:
+            if gid not in color:  # 参数或子实例：叶子
+                return
+            if color[gid] == 1:
+                report(f"{where} 的门引用关系存在环（涉及门 {gid!r}）")
+                return
+            if color[gid] == 2:
+                return
+            color[gid] = 1
+            for child in gate_inputs[gid]:
+                dfs_gate(child)
+            color[gid] = 2
+
+        for gid in gate_ops:
+            dfs_gate(gid)
+
+        # ---- 子实例：模板存在性与 bindings 覆盖/取值 ----
+        for inst in tpl.instances:
+            if inst.template not in templates:
+                report(
+                    f"{where} 的实例 {inst.id!r} 引用了未定义模板："
+                    f"{inst.template!r}"
+                )
+                continue
+            callee_params = set(templates[inst.template].params)
+            bound = set(inst.bindings)
+            missing = callee_params - bound
+            extra = bound - callee_params
+            if missing:
+                report(
+                    f"{where} 的实例 {inst.id!r} 绑定缺少被调模板 "
+                    f"{inst.template!r} 的参数："
+                    + ", ".join(repr(p) for p in sorted(missing))
+                )
+            if extra:
+                report(
+                    f"{where} 的实例 {inst.id!r} 绑定出现了被调模板 "
+                    f"{inst.template!r} 未声明的参数："
+                    + ", ".join(repr(p) for p in sorted(extra))
+                )
+            bad_values = sorted(
+                {v for v in inst.bindings.values() if v not in seen_params}
+            )
+            if bad_values:
+                report(
+                    f"{where} 的实例 {inst.id!r} 绑定只能引用本模板参数，"
+                    "非法引用：" + ", ".join(repr(v) for v in bad_values)
+                )
+
+    if errors:
+        raise ValueError("；".join(errors))
+
+
+def _check_template_recursion(templates: Dict[str, TemplateIn]) -> None:
+    """在实例调用图上检测模板递归（含自调用），成环则抛 ValueError。
+
+    从全部模板各自出发做 DFS（调用图是有限图，重复访问直接复用结果），
+    故未被 root 引用的模板若参与递归环同样报错；root 未定义的情形由
+    调用方先行拦截。
+    """
+    color: Dict[str, int] = {}  # 0=未访问, 1=在栈中, 2=完成
+
+    def dfs(tname: str, stack: List[str]) -> None:
+        state = color.get(tname, 0)
+        if state == 1:
+            cycle = stack[stack.index(tname):] + [tname]
+            raise ValueError(
+                "模板递归调用成环：" + " → ".join(cycle)
+                + "；实例展开不允许递归"
+            )
+        if state == 2:
+            return
+        color[tname] = 1
+        for inst in templates[tname].instances:
+            if inst.template in templates:  # 引用未定义模板已在静态校验中报错
+                dfs(inst.template, stack + [tname])
+        color[tname] = 2
+
+    for tname in templates:
+        dfs(tname, [])
+
+
+def expand_model_logic(payload: ExpandModelRequest) -> ExpandModelResponse:
+    """把参数化模板的 root 实例递归展开为扁平的 gates/top。"""
+    # 事件与事件概率沿用 /v1/analyze 的校验（id、重复、n/d 概率）
+    probs = _validate_events(payload.events)
+
+    errors: List[str] = []
+
+    # 全部模板的静态校验（不依赖展开；未被 root 引用的模板同样检查）
+    try:
+        _validate_templates_static(payload.templates)
+    except ValueError as exc:
+        errors.append(str(exc))
+
+    # root 模板存在性与绑定（恰好覆盖根模板参数，值只能是已声明事件 id）
+    if payload.root.template not in payload.templates:
+        errors.append(f"root 引用了未定义模板：{payload.root.template!r}")
+    else:
+        root_params = set(payload.templates[payload.root.template].params)
+        bound = set(payload.root.bindings)
+        missing = root_params - bound
+        extra = bound - root_params
+        if missing:
+            errors.append(
+                "root 绑定缺少根模板 "
+                f"{payload.root.template!r} 的参数："
+                + ", ".join(repr(p) for p in sorted(missing))
+            )
+        if extra:
+            errors.append(
+                "root 绑定出现了根模板 "
+                f"{payload.root.template!r} 未声明的参数："
+                + ", ".join(repr(p) for p in sorted(extra))
+            )
+        bad_events = sorted(
+            {v for v in payload.root.bindings.values() if v not in probs}
+        )
+        if bad_events:
+            errors.append(
+                "root 绑定只能引用已声明事件 id，非法引用："
+                + ", ".join(repr(v) for v in bad_events)
+            )
+    if errors:
+        raise ValueError("；".join(errors))
+
+    # 模板递归检测（全部模板的实例调用成环，含自调用、未被 root 引用的）
+    _check_template_recursion(payload.templates)
+
+    root_tpl = payload.root.template
+    root_bindings = dict(payload.root.bindings)
+    out_gates: List[GateIn] = []
+
+    def child_param_map(inst: TemplateInstanceIn, param_map: Dict[str, str]):
+        return {
+            callee_param: param_map[inst.bindings[callee_param]]
+            for callee_param in payload.templates[inst.template].params
+        }
+
+    def top_reference(
+        tname: str,
+        path: str,
+        param_map: Dict[str, str],
+    ) -> str:
+        """沿 top 链解析模板 tname 顶层引用的全局 id（不展开门）。"""
+        tpl = payload.templates[tname]
+        top = tpl.top
+        if top in param_map:  # 顶层直接是参数 → root 绑定的事件 id
+            return param_map[top]
+        inst_by_id = {inst.id: inst for inst in tpl.instances}
+        if top in inst_by_id:  # 顶层是子实例 → 继续沿子实例的 top 链
+            inst = inst_by_id[top]
+            return top_reference(
+                inst.template, f"{path}.{inst.id}", child_param_map(inst, param_map)
+            )
+        return f"{path}/{top}"  # 顶层是本地门 → 全路径门名
+
+    def instantiate(
+        tname: str,
+        path: str,
+        param_map: Dict[str, str],
+    ) -> str:
+        """在实例路径 path 处展开模板 tname，返回其 top 解析后的全局引用。
+
+        param_map：本模板形参 → 全局事件 id（root 直接绑事件；子实例经
+        父级 param_map 传递，天然实现共享事件保留原 id）。
+        门按「本模板门先于子实例深层门」的前序加入。
+        """
+        tpl = payload.templates[tname]
+        child_tops: Dict[str, str] = {}
+        for inst in tpl.instances:
+            child_tops[inst.id] = top_reference(
+                inst.template, f"{path}.{inst.id}", child_param_map(inst, param_map)
+            )
+
+        def resolve(ref: str) -> str:
+            if ref in param_map:          # 本地参数 → 全局共享事件 id
+                return param_map[ref]
+            if ref in child_tops:         # 子实例 → 该实例 top 的全局引用
+                return child_tops[ref]
+            return f"{path}/{ref}"        # 本地门 → 全路径门名
+
+        # 本模板门先加入（对子实例的引用直接指向其确定的 top 全局 id）
+        for gate in tpl.gates:
+            out_gates.append(
+                GateIn(
+                    id=f"{path}/{gate.id}",
+                    op=gate.op,
+                    inputs=[resolve(ref) for ref in gate.inputs],
+                )
+            )
+            if len(out_gates) > MAX_EXPANDED_GATES:
+                raise ValueError(
+                    f"展开后的门数超过 {MAX_EXPANDED_GATES} 个上限："
+                    f"展开到路径 {path!r} 的门 {gate.id!r} 时已有 "
+                    f"{len(out_gates)} 个门"
+                )
+
+        # 再递归展开子实例；门环与引用完整性统一交给展开后的
+        # _validate_gates 复核（前序排序不影响判定）
+        for inst in tpl.instances:
+            instantiate(
+                inst.template, f"{path}.{inst.id}", child_param_map(inst, param_map)
+            )
+        return resolve(tpl.top)
+
+    top_ref = instantiate(root_tpl, "root", root_bindings)
+
+    # 展开结果沿用门的全部校验：元数、未知引用、门环，以及全路径门名与
+    # 事件 id 冲突等结构问题（静态校验已保证大部分，这里做最终兜底）
+    _validate_gates(probs, out_gates, top_ref)
+
+    return ExpandModelResponse(
+        events=list(payload.events), gates=out_gates, top=top_ref
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
@@ -1330,4 +1747,14 @@ async def observation_conflicts(
         return _bad_request(str(exc))  # type: ignore[return-value]
     except ValueError as exc:
         # 未知引用、环、非法观测键/值、组数超限等全部语义错误
+        return _bad_request(str(exc))  # type: ignore[return-value]
+
+
+@app.post("/v1/expand-model", response_model=ExpandModelResponse)
+async def expand_model(payload: ExpandModelRequest) -> ExpandModelResponse:
+    try:
+        return expand_model_logic(payload)
+    except ValueError as exc:
+        # 非法事件/概率、名称冲突、绑定错误、未知引用、门环、模板递归、
+        # 引用未定义模板或展开后门数超过 64 等全部语义错误
         return _bad_request(str(exc))  # type: ignore[return-value]
